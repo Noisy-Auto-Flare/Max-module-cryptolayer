@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+.venv/
+venv/
+
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+
+# Secrets & sessions
+.env
+secrets*
+*.session
+sessions/
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
+
+# OMO working files (not part of the module)
+.omo/
+.codegraph/
