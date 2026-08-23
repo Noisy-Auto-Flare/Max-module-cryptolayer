@@ -49,6 +49,10 @@ def make_module(monkeypatch):
     monkeypatch.setattr(MaxMain, "_SEND_MESSAGE_FN", lambda *a: {"ok": True})
 
     def _make(client=None, creds=None):
+        # BaseModule.stop_event is a CLASS-level Event shared by every
+        # instance — a previous test may leave it set, which would fire
+        # this module's watcher instantly. Reset it per module.
+        MaxMain.Max.stop_event.clear()
         client = FakeClient() if client is None else client
 
         def _fake_build(token, device_id):
@@ -69,6 +73,7 @@ def make_module(monkeypatch):
     for mod, _client in created:
         mod.stop_event.set()
         mod._shutdown()
+    MaxMain.Max.stop_event.clear()  # shared class-level event (see _make)
 
 
 def _start_listener(mod):
@@ -174,3 +179,29 @@ class TestFailurePath:
         for thread in _module_threads(mod):
             thread.join(timeout=_JOIN_S)
             assert not thread.is_alive()
+
+    def test_shutdown_with_already_closed_loop_no_unawaited_warning(
+        self, make_module, recwarn
+    ):
+        """Dead-loop teardown: no 'never awaited' RuntimeWarning escapes."""
+        mod, client = make_module()
+
+        # Simulate the loop dying BEFORE shutdown (race / prior teardown).
+        mod._loop.call_soon_threadsafe(mod._loop.stop)
+        mod._loop_thread.join(timeout=_JOIN_S)
+        assert not mod._loop_thread.is_alive()
+        mod._loop.close()  # stop alone leaves it open; task-4 closes it
+        assert mod._loop.is_closed()
+
+        mod.stop()  # must complete cleanly, skipping disconnect
+
+        for thread in _module_threads(mod):
+            thread.join(timeout=_JOIN_S)
+            assert not thread.is_alive(), f"{thread.name} did not finish"
+        assert client.disconnect_calls == 0  # never even attempted
+        never_awaited = [
+            w for w in recwarn
+            if issubclass(w.category, RuntimeWarning)
+            and "never awaited" in str(w.message)
+        ]
+        assert never_awaited == []

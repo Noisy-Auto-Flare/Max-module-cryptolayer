@@ -904,19 +904,39 @@ class Max(BaseModule):
         client = session["client"]
 
         # Idempotent wrapper around the NOT-idempotent vkmax disconnect.
-        try:
+        # Guard BEFORE constructing the coroutine: on a CLOSED loop
+        # run_coroutine_threadsafe raises before scheduling (leaving the
+        # coroutine unawaited), and on a STOPPED-but-open loop it silently
+        # queues work that never runs — hanging the future to its timeout.
+        if not loop.is_closed() and loop.is_running():
+            try:
 
-            async def _disconnect():
-                await client.disconnect()
+                async def _disconnect():
+                    await client.disconnect()
 
-            asyncio.run_coroutine_threadsafe(_disconnect(), loop).result(
-                _DISCONNECT_TIMEOUT_S
-            )
-        except Exception:  # noqa: BLE001 — §6: raises in many legal states
+                coro = _disconnect()
+                try:
+                    asyncio.run_coroutine_threadsafe(coro, loop).result(
+                        _DISCONNECT_TIMEOUT_S
+                    )
+                except BaseException:
+                    # Belt-and-suspenders: never leak an unawaited
+                    # coroutine (a running one cannot be closed — ignore).
+                    try:
+                        coro.close()
+                    except RuntimeError:
+                        pass
+                    raise
+            except Exception:  # noqa: BLE001 — §6: raises in many states
+                logger.warning(
+                    "Shutdown: client.disconnect() failed "
+                    "(keepalive already stopped or connection gone)",
+                    exc_info=True,
+                )
+        else:
             logger.warning(
-                "Shutdown: client.disconnect() failed "
-                "(keepalive already stopped or connection gone)",
-                exc_info=True,
+                "Shutdown: session loop already closed or not running; "
+                "skipping client.disconnect() (connection is gone anyway)"
             )
 
         # Cancel whatever futures/tasks are still pending on the loop
