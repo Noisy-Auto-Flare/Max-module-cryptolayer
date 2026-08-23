@@ -29,7 +29,7 @@ class FakeClient:
         self.connect_calls = 0
         self.login_calls = []
         self.login_response = (
-            {"payload": {"profile": {"id": 777}}}
+            {"payload": {"profile": {"contact": {"id": 777}}}}
             if login_response is None
             else login_response
         )
@@ -181,6 +181,17 @@ class TestFailures:
 
         mod._loop_thread.join(timeout=2)
         assert not mod._loop_thread.is_alive()
+
+    def test_my_id_fallback_legacy_profile_id_path(self, make_module):
+        """Legacy payload.profile.id still works when contact.id is absent."""
+        mod, _client = make_module(
+            client=FakeClient(
+                login_response={"payload": {"profile": {"id": 555}}}
+            )
+        )
+        mod.create_session(lambda text: None)
+        assert mod._session["my_id"] == 555
+        mod.stop()
 
     def test_no_thread_leak_after_failure(self, make_module):
         before = threading.active_count()

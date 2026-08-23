@@ -782,7 +782,7 @@ class Max(BaseModule):
         async def _login():
             # Contract §2: connect() MUST precede login (@ensure_connected
             # raises otherwise); login_by_token RETURNS the full server
-            # response (§1.1/§2), so profile.id comes straight out of it.
+            # response (§1.1/§2), from which the own id is read below.
             client = _build_client(token, device_id)
             await client.connect()
             response = await asyncio.wait_for(
@@ -800,16 +800,27 @@ class Max(BaseModule):
             ) from exc
 
         # Own id — HARD requirement for sender-echo filtering (task 5).
-        # Contract §5: client.me does NOT exist; payload.profile.id of the
-        # login response is the ONLY source. Unreadable → RuntimeError.
+        # Contract §5 (LIVE-CONFIRMED 2026-08-23, scripts/dump_profile.py):
+        # client.me does NOT exist; own id lives at
+        # payload.profile.contact.id on the live server (corroborated by
+        # chat.owner / lastMessage.sender / participants keys). Legacy
+        # payload.profile.id kept as a defensive fallback. Unreadable
+        # through BOTH paths → RuntimeError.
+        my_id = None
         try:
-            my_id = login_response["payload"]["profile"]["id"]
-        except (KeyError, TypeError) as exc:
-            self._stop_loop_thread()
-            raise RuntimeError(
-                "MAX login failed: my id unavailable "
-                "(payload.profile.id missing in login response)"
-            ) from exc
+            profile = login_response["payload"]["profile"]
+            my_id = profile["contact"]["id"]
+        except (KeyError, TypeError):
+            pass
+        if my_id is None:
+            try:
+                my_id = login_response["payload"]["profile"]["id"]  # legacy
+            except (KeyError, TypeError) as exc:
+                self._stop_loop_thread()
+                raise RuntimeError(
+                    "MAX login failed: my id unavailable "
+                    "(payload.profile.contact.id missing in login response)"
+                ) from exc
 
         self._session = {
             "client": client,

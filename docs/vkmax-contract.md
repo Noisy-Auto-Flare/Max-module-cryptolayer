@@ -120,22 +120,36 @@ packet = {"ver": 11, "cmd": <int>, "seq": <int>, "opcode": 128, "payload": {...}
   путь взят из независимой реализации того же протокола (max2tg) и подлежит
   контролю при раннем живом чекпойнте (задача 12).
 
-## 5. Свой id (`my_id`)
+## 5. Свой id (`my_id`) — ЖИВО ПОДТВЕРЖДЕНО 2026-08-23
 
-`client.me` НЕ существует. Единственный источник собственного id — ответ логина:
+`client.me` НЕ существует. Источник собственного id — ответ логина:
 
 ```
 login_response = await client.login_by_token(token, device_id)
-my_id = login_response["payload"]["profile"]["id"]
+my_id = login_response["payload"]["profile"]["contact"]["id"]   # ЖИВОЙ путь
 ```
 
-- Сам vkmax читает из этого же объекта только телефон
+- **Живое подтверждение** (`scripts/dump_profile.py`, токен владельца):
+  `payload.profile.contact.id = 393356389`; путь сходится с тремя
+  независимыми местами той же выгрузки: `chat.owner`,
+  `chat.lastMessage.sender` и ключами `chat.participants`.
+- **Фолбэк** `payload.profile.id` сохранён в адаптере как защитный
+  (легаси-путь; на живом сервере этого ключа НЕТ).
+- Сам vkmax читает из profile только телефон
   `["payload"]["profile"]["contact"]["phone"]` в try/except (`client.py:303-307`)
-  — наличие `profile` в payload подтверждено кодом библиотеки.
-- Наличие ключа `id` внутри `profile` подтверждается эталонными клиентами
-  (max2tg: `payload.get("profile", {}).get("id")` после AUTH_SNAPSHOT op=19).
-  Контроль — задача 12. Адаптер (задача 4) ОБЯЗАН падать RuntimeError, если
-  `profile.id` не читается.
+  — наличие `profile.contact` подтверждено и кодом библиотеки, и живой выгрузкой.
+- Если id не читается ни по одному из путей — адаптер обязан падать
+  RuntimeError (эхо-фильтрация задачи 5 без него невозможна).
+
+### Живое подтверждение остальных полей (чекпойнт задачи 12, выполнен)
+
+| Поле контракта | Статус |
+| --- | --- |
+| вход по токену `login_by_token(token, device_id)` | ✅ живой логин успешен |
+| `payload.chats` (список диалогов) | ✅ 7 диалогов извлечены |
+| идентификатор диалога: `chat.chatId`, фолбэк `chat.id` | ✅ таблица discovery корректна (типы DIALOG) |
+| отправитель сообщения: `message.sender` (int user_id) | ✅ `lastMessage.sender == contact.id владельца` |
+| свой id: `payload.profile.contact.id` | ✅ см. выше (спайковый `profile.id` опровергнут) |
 
 ## 6. SHUTDOWN (специальный раздел)
 
