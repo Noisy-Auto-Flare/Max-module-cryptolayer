@@ -65,6 +65,9 @@ logger = logging.getLogger(__name__)
 _LOGIN_TIMEOUT_S = 30.0
 _RESULT_TIMEOUT_S = 45.0
 _THREAD_JOIN_TIMEOUT_S = 5.0
+# Contract §6: disconnect is awaited through run_coroutine_threadsafe
+# with its OWN bounded timeout (plan task 7).
+_DISCONNECT_TIMEOUT_S = 10.0
 
 _DEFAULT_MIN_PAUSE_S = 2.0
 _DEFAULT_MAX_PAUSE_S = 6.0
@@ -821,3 +824,119 @@ class Max(BaseModule):
             list(self.credentials), ingester, user_id, self._session
         )
         self.sender = self.Sender(list(self.credentials), user_id, self._session)
+
+        # Task 7: watcher thread armed LAST — the shared stop_event is the
+        # single shutdown signal (docs §3.4: the core sends DISCONNECT,
+        # the module just quietly stops).
+        self._shutdown_done = threading.Event()
+        self._stop_watcher = threading.Thread(
+            target=self._watch_stop, name="max-stop-watcher", daemon=True
+        )
+        self._stop_watcher.start()
+
+    # --- graceful shutdown (task 7) ----------------------------------------
+
+    def _watch_stop(self):
+        """Block on the shared stop_event, then run the full shutdown."""
+        try:
+            self.stop_event.wait()
+            self._shutdown()
+        except Exception:  # noqa: BLE001 — a watcher must never crash loud
+            logger.error(
+                "Stop-watcher failed", exc_info=True
+            )
+
+    def stop(self):
+        """Public graceful-shutdown entry point.
+
+        Sets the shared ``stop_event`` (so Listener/worker loops notice)
+        and runs the same idempotent teardown the watcher runs. Calling
+        it a second time is a no-op.
+        """
+        if getattr(self, "_session", None) is None:
+            return  # session never brought up — nothing to stop
+        self.stop_event.set()
+        self._shutdown()
+        # The watcher may have won the idempotence race and be doing the
+        # teardown right now — wait for it so stop() always returns
+        # AFTER shutdown has fully completed.
+        watcher = getattr(self, "_stop_watcher", None)
+        if watcher is not None and watcher is not threading.current_thread():
+            watcher.join(timeout=_THREAD_JOIN_TIMEOUT_S)
+
+    def _shutdown(self):
+        """Idempotent teardown: workers first, THEN client disconnect.
+
+        Order matters (contract §6): vkmax's ``disconnect()`` cancels
+        ``_recv_task`` but strands pending ``invoke_method`` futures
+        forever — sends must be prevented BEFORE disconnecting. Every
+        step is wrapped in try/except because disconnect is NOT
+        idempotent and raises when keepalive is not running.
+        """
+        done = getattr(self, "_shutdown_done", None)
+        if done is None:
+            done = self._shutdown_done = threading.Event()
+        if done.is_set():
+            return  # IDEMPOTENCE: second stop is a no-op
+        done.set()
+
+        sender = self.sender
+        listener = self.listener
+        if sender is not None:
+            try:
+                # Stop the pacing worker FIRST and drop everything still
+                # queued — nothing new may hit the transport from now on.
+                sender.request_stop()
+                sender._clear_queue()
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "Shutdown: stopping sender worker failed", exc_info=True
+                )
+
+        if listener is not None:
+            try:
+                listener._ingest_queue.put_nowait(None)  # poison pill
+            except queue.Full:  # pragma: no cover — worker drains promptly
+                pass
+
+        session = self._session
+        loop = session["loop"]
+        client = session["client"]
+
+        # Idempotent wrapper around the NOT-idempotent vkmax disconnect.
+        try:
+
+            async def _disconnect():
+                await client.disconnect()
+
+            asyncio.run_coroutine_threadsafe(_disconnect(), loop).result(
+                _DISCONNECT_TIMEOUT_S
+            )
+        except Exception:  # noqa: BLE001 — §6: raises in many legal states
+            logger.warning(
+                "Shutdown: client.disconnect() failed "
+                "(keepalive already stopped or connection gone)",
+                exc_info=True,
+            )
+
+        # Cancel whatever futures/tasks are still pending on the loop
+        # (stranded invoke_method futures would otherwise keep running).
+        def _cancel_pending():
+            for task in asyncio.all_tasks(loop):
+                task.cancel()
+
+        try:
+            loop.call_soon_threadsafe(_cancel_pending)
+        except RuntimeError:
+            pass  # loop already closed between check and call
+
+        # Join module threads with timeout, then tear down the loop
+        # thread via the task-4 primitive (stop + join + close).
+        if sender is not None:
+            sender.join_worker(timeout=_THREAD_JOIN_TIMEOUT_S)
+        if listener is not None:
+            ingest_thread = listener._ingest_thread
+            if ingest_thread is not None:
+                ingest_thread.join(timeout=_THREAD_JOIN_TIMEOUT_S)
+        self._stop_loop_thread()
+        logger.info("MAX module stopped cleanly")
