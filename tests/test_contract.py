@@ -51,16 +51,33 @@ class TestRequiredAttributes:
         assert issubclass(MaxMain.Max.Sender, BaseModule.Sender)
         assert issubclass(MaxMain.Max.Listener, BaseModule.Listener)
 
-    def test_skeleton_raises_not_implemented(self):
-        # Tasks 4-7 implement these; the skeleton must NOT carry logic yet.
-        with pytest.raises(NotImplementedError):
-            MaxMain.Max().create_session(lambda text: None)
+    def test_stub_bodies_raise_not_implemented(self):
+        # Task 4 wired construction (create_session + instantiable nested
+        # classes with a session holder); send/listen BODIES still arrive
+        # in tasks 5-6 and must remain stubs.
         creds = ["tok", "dev", "123", "", ""]
+        session = {
+            "client": object(),
+            "loop": None,
+            "chat_id": 123,
+            "my_id": 1,
+            "stop_event": threading.Event(),
+            "min_pause": 2.0,
+            "max_pause": 6.0,
+        }
+        def ingester(text):
+            return None
+
+        sender = MaxMain.Max.Sender(creds, "123", session)
+        listener = MaxMain.Max.Listener(creds, ingester, "123", session)
+        assert listener.ingester is ingester
+        assert listener.stop_event is session["stop_event"]
+        assert sender.session is session
+        assert listener.session is session
         with pytest.raises(NotImplementedError):
-            MaxMain.Max.Sender(creds, "123")
-        stop_event = threading.Event()
+            sender.send("hi")
         with pytest.raises(NotImplementedError):
-            MaxMain.Max.Listener(creds, lambda text: None, "123", stop_event)
+            listener.listen()
 
 
 class TestContractEnforcement:
