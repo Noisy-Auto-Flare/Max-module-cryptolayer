@@ -53,8 +53,8 @@ class TestRequiredAttributes:
 
     def test_stub_bodies_raise_not_implemented(self):
         # Task 4 wired construction (create_session + instantiable nested
-        # classes with a session holder); send/listen BODIES still arrive
-        # in tasks 5-6 and must remain stubs.
+        # classes with a session holder); listen BODY still arrives in
+        # task 5 and must remain a stub.
         creds = ["tok", "dev", "123", "", ""]
         session = {
             "client": object(),
@@ -74,8 +74,12 @@ class TestRequiredAttributes:
         assert listener.stop_event is session["stop_event"]
         assert sender.session is session
         assert listener.session is session
-        with pytest.raises(NotImplementedError):
-            sender.send("hi")
+        # Task 6 SUPERSEDED the send() stub by design (paced sender):
+        # send() now enqueues non-blockingly instead of raising. With no
+        # running worker thread it must still return without sending.
+        sender._ensure_worker = lambda: None  # pin worker off for stub check
+        sender.send("hi")
+        assert sender._queue.get_nowait() == "hi"
         with pytest.raises(NotImplementedError):
             listener.listen()
 
