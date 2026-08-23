@@ -53,11 +53,11 @@ class TestRequiredAttributes:
 
     def test_stub_bodies_raise_not_implemented(self):
         # Task 4 wired construction (create_session + instantiable nested
-        # classes with a session holder); listen BODY still arrives in
-        # task 5 and must remain a stub.
+        # classes with a session holder).
         creds = ["tok", "dev", "123", "", ""]
+        client = _CallbackClient()
         session = {
-            "client": object(),
+            "client": client,
             "loop": None,
             "chat_id": 123,
             "my_id": 1,
@@ -80,8 +80,23 @@ class TestRequiredAttributes:
         sender._ensure_worker = lambda: None  # pin worker off for stub check
         sender.send("hi")
         assert sender._queue.get_nowait() == "hi"
-        with pytest.raises(NotImplementedError):
-            listener.listen()
+        # Task 5 SUPERSEDED the listen() stub by design (callback-driven
+        # receiver): listen() no longer raises — it blocks on the shared
+        # stop_event; a pre-set stop_event makes it return immediately.
+        listener.stop_event.set()
+        listener.listen()
+        # Registration happened synchronously before the wait (contract §3).
+        assert len(client.registered) == 1
+
+
+class _CallbackClient:
+    """Minimal client double: records set_packet_callback registrations."""
+
+    def __init__(self):
+        self.registered = []
+
+    def set_packet_callback(self, function):
+        self.registered.append(function)
 
 
 class TestContractEnforcement:

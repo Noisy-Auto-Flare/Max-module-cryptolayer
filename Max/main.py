@@ -32,7 +32,21 @@ of one message when the text is unclassifiable) → ERROR log with an
 actionable message («проверьте Token / Chat ID»), queue cleared, worker
 stops WITHOUT touching stop_event. Typing emulation is NOT implemented —
 contract §12 verdict NO (ADR-3a, documented in task 10).
-Packet handling (Listener, task 5) is still a stub.
+Packet handling (Listener, task 5): ``set_packet_callback`` registers an
+async handler taking ``(client, packet)`` (contract §3, SYNC registration).
+opcode 128 packets for OUR chat from a FOREIGN sender have their text
+handed to ``ingester`` through ONE dedicated FIFO worker thread — the
+asyncio-loop thread never runs kernel code, so downstream processing
+cannot stall the ws heartbeat. Own echo (sender == my_id, guaranteed by
+task 4), foreign chats and non-128 opcodes are filtered out; any handler
+exception is logged as a warning without killing the ws thread. vkmax has
+NO internal reconnection (contract §12 verdict NO), so the listener
+thread supervises the connection itself: on drop it waits 5→10→20→40 s
+(cap 60 s), builds a NEW MaxClient via ``_build_client``, reconnects and
+logs in again; after 5 consecutive failed reconnects it logs a terminal
+ERROR («MAX connection lost permanently») and quietly exits. ``listen()``
+is a blocking call suitable for ``Thread(target=listen)``; it returns as
+soon as the shared ``stop_event`` is set.
 """
 
 import asyncio
@@ -149,6 +163,28 @@ def _get_send_message():
 
 
 _SEND_MESSAGE_FN = None
+
+
+# --- Listener (task 5): filtering, FIFO ingest, reconnect supervision ---
+
+# Reconnect backoff schedule: 5 → 10 → 20 → 40 s, capped at 60 s
+# (plan task 5); each pause waits through the interruptible stop_event.
+_RECONNECT_BASE_S = 5.0
+_RECONNECT_CAP_S = 60.0
+_MAX_FAILED_RECONNECTS = 5  # consecutive failures → terminal ERROR + exit
+
+# How often the supervising listen() thread re-checks ws liveness while
+# the connection is healthy. Cheap: one done() call per second.
+_SUPERVISOR_POLL_S = 1.0
+
+# Bound of the ingester hand-off queue. The CryptoLayer kernel transport
+# drops packets older than 5 minutes; at this module's human-paced rates
+# a 5-minute window can never approach five digits of chunks, so overflow
+# is only reachable when the kernel's ingester is wedged — exactly the
+# case where an unbounded queue would eat memory without end. On Full we
+# drop the NEWEST chunk (oldest stay queued): the delivered prefix stays
+# contiguous, which is what kernel chunk-reassembly cares about.
+_INGEST_QUEUE_MAXSIZE = 10000
 
 
 def _classify_send_error(exc: BaseException) -> str:
@@ -405,11 +441,19 @@ class Max(BaseModule):
                     return
 
     class Listener(BaseModule.Listener):
-        """Incoming-packet handler with filtering (implemented in task 5).
+        """Incoming-packet handler with filtering (task 5).
 
         Same overridden-``__init__`` contract as Sender; additionally
         holds ``ingester`` (via the base class) and takes its stop_event
         from the session holder (single shared shutdown signal).
+
+        Threading model (plan task 5): vkmax dispatches the packet
+        callback as an asyncio task on the session loop (contract §3) —
+        arbitrary kernel code must NOT run there or the ws heartbeat
+        stalls. The handler therefore only FILTERS and ENQUEUES; exactly
+        ONE dedicated worker thread consumes the FIFO queue and calls
+        ``ingester``. Multiple consumers are forbidden: kernel chunk
+        ordering depends on delivery order.
         """
 
         def __init__(self, credentials, ingester, user_id, session):
@@ -429,9 +473,226 @@ class Max(BaseModule):
                     chat_id_cred,
                 )
             self.session = session
+            # Base Listener.__init__ does NOT keep credentials; reconnect
+            # needs Token/Device ID, so keep our own normalized copy.
+            self._credentials = [
+                "" if c is None else str(c) for c in credentials
+            ]
+            self._ingest_queue = queue.Queue(maxsize=_INGEST_QUEUE_MAXSIZE)
+            self._ingest_thread = None
 
-        def listen(self) -> str:
-            raise NotImplementedError("listen is implemented in plan task 5")
+        # --- registration + packet handling -----------------------------------
+
+        def _register_on(self, client):
+            """Register the packet callback — a SYNC call (contract §3).
+
+            The callback MUST be an async function taking two positional
+            arguments ``(client, packet)``; vkmax raises TypeError for
+            sync functions and dispatches via ``asyncio.create_task`` on
+            ANY non-pending-seq packet, so this handler catches its own
+            exceptions (they would otherwise die silently in the task).
+            """
+            client.set_packet_callback(self._on_packet)
+
+        async def _on_packet(self, client, packet):
+            """Filter one pushed packet; NEVER raises outward.
+
+            opcode != 128 and foreign chats are silently ignored; own
+            echo is excluded by comparing ``payload.message.sender``
+            against ``my_id`` (guaranteed present by task 4 — no
+            degraded chat_id-only mode, or our own sends would loop);
+            malformed payloads log a warning and are dropped.
+            """
+            try:
+                if not isinstance(packet, dict):
+                    logger.warning(
+                        "Listener: non-dict packet of type %s dropped",
+                        type(packet).__name__,
+                    )
+                    return
+                if packet.get("opcode") != 128:
+                    return  # not a message push — silently ignore
+                payload = packet.get("payload")
+                if not isinstance(payload, dict):
+                    logger.warning(
+                        "Listener: op=128 packet without payload dict dropped"
+                    )
+                    return
+                if payload.get("chatId") != self.session["chat_id"]:
+                    return  # foreign dialog — silently ignore
+                message = payload.get("message")
+                if not isinstance(message, dict) or "sender" not in message:
+                    # "sender" path is live-unconfirmed until owner
+                    # checkpoint (contract §4); delivering on schema
+                    # drift would mask it — warn instead.
+                    logger.warning(
+                        "Listener: op=128 for our chat lacks "
+                        "message/sender fields; packet dropped"
+                    )
+                    return
+                if message["sender"] == self.session["my_id"]:
+                    return  # own echo — excluded to break send loops
+                text = message.get("text")
+                if text is None:
+                    logger.warning(
+                        "Listener: op=128 message without text dropped"
+                    )
+                    return
+                self._enqueue(str(text))
+            except Exception:  # noqa: BLE001 — handler must never kill ws
+                logger.warning(
+                    "Listener: packet handling failed", exc_info=True
+                )
+
+        def _enqueue(self, text: str):
+            """Hand one filtered chunk to the ingest worker (non-blocking)."""
+            try:
+                self._ingest_queue.put_nowait(text)
+            except queue.Full:
+                # Drop the NEWEST chunk: the queued prefix stays
+                # contiguous for kernel reassembly (see queue-bound note).
+                logger.warning(
+                    "Listener: ingest queue full (%d); dropping newest chunk",
+                    _INGEST_QUEUE_MAXSIZE,
+                )
+
+        # --- single-consumer FIFO worker --------------------------------------
+
+        def _start_ingest_worker(self):
+            """Start THE dedicated ingest thread (idempotent).
+
+            Single consumer BY DESIGN (plan task 5): kernel chunk order
+            equals delivery order only with one consumer multiplying
+            threads is forbidden.
+            """
+            if self._ingest_thread is not None and self._ingest_thread.is_alive():
+                return
+            self._ingest_thread = threading.Thread(
+                target=self._run_ingest_worker,
+                name="max-listener-ingest",
+                daemon=True,
+            )
+            self._ingest_thread.start()
+
+        def _run_ingest_worker(self):
+            stop_event = self.session["stop_event"]
+            while True:
+                try:
+                    item = self._ingest_queue.get(timeout=_WORKER_POLL_S)
+                except queue.Empty:
+                    if stop_event.is_set():
+                        return
+                    continue
+                if item is None:  # poison pill (task 7 shutdown)
+                    return
+                try:
+                    self.ingester(item)
+                except Exception:  # noqa: BLE001 — downstream is foreign code
+                    logger.warning(
+                        "Listener: ingester raised; continuing", exc_info=True
+                    )
+
+        # --- connection supervision / reconnect -------------------------------
+
+        @staticmethod
+        def _ws_dead(client) -> bool:
+            """True when the client's receive loop has ended.
+
+            Contract §12: without a reconnect hook vkmax's recv-loop dies
+            SILENTLY on a ws drop, and §6 disconnect() cancels
+            ``_recv_task`` — either way a finished ``_recv_task`` means
+            the connection is gone. Duck-typed so fakes need no asyncio.
+            """
+            recv = getattr(client, "_recv_task", None)
+            return recv is None or recv.done()
+
+        def _reconnect(self):
+            """Build a NEW client, connect and log in again.
+
+            Contract §6/§13: reconnect = fresh MaxClient() per cycle
+            (clean ``_pending``/``_seq``), NOT reuse of the dead one.
+            Raises on any failure — the caller counts consecutive fails.
+            """
+            token = self._credentials[0].strip()
+            device_id = self._credentials[1].strip()
+            client = _build_client(token, device_id)
+
+            async def _bring_up():
+                await client.connect()
+                await asyncio.wait_for(
+                    client.login_by_token(token, device_id),
+                    timeout=_LOGIN_TIMEOUT_S,
+                )
+
+            asyncio.run_coroutine_threadsafe(
+                _bring_up(), self.session["loop"]
+            ).result(_RESULT_TIMEOUT_S + 1.0)
+            self._register_on(client)
+            return client
+
+        def listen(self):
+            """Blocking receiver entry point (for ``Thread(target=listen)``).
+
+            Registers the packet callback, starts the single ingest
+            worker, then supervises the connection: while healthy it
+            merely waits on the shared stop_event (the plan-mandated
+            blocking-stub behaviour); on a detected drop it reconnects
+            with 5→10→20→40 s (cap 60 s) pauses. After 5 consecutive
+            FAILED reconnect attempts it logs a terminal ERROR («MAX
+            connection lost permanently») and quietly returns — the core
+            detects the death via its own ping timeout. Returns as soon
+            as stop_event is set.
+            """
+            session = self.session
+            stop_event = session["stop_event"]
+            self._start_ingest_worker()
+            client = session["client"]
+            self._register_on(client)
+            logger.info(
+                "Listener: receiving packets for chat %s", session["chat_id"]
+            )
+
+            delay = _RECONNECT_BASE_S
+            failed_reconnects = 0
+            while not stop_event.is_set():
+                if not self._ws_dead(client):
+                    stop_event.wait(_SUPERVISOR_POLL_S)
+                    continue
+                if stop_event.is_set():
+                    break
+                logger.warning(
+                    "MAX websocket connection lost; reconnecting in %.0f s",
+                    delay,
+                )
+                if stop_event.wait(delay):
+                    break
+                delay = min(delay * 2, _RECONNECT_CAP_S)
+                try:
+                    client = self._reconnect()
+                except Exception as exc:  # noqa: BLE001 — vkmax generic
+                    failed_reconnects += 1
+                    logger.warning(
+                        "Listener: reconnect attempt %d/%d failed (%s: %s)",
+                        failed_reconnects,
+                        _MAX_FAILED_RECONNECTS,
+                        type(exc).__name__,
+                        exc,
+                    )
+                    if failed_reconnects >= _MAX_FAILED_RECONNECTS:
+                        logger.error(
+                            "MAX connection lost permanently после %d "
+                            "неудачных переподключений — проверьте Token / "
+                            "Device ID и доступность сети; поток приёма "
+                            "остановлен (ядро обнаружит таймаут пинга).",
+                            failed_reconnects,
+                        )
+                        return
+                    continue
+                failed_reconnects = 0
+                delay = _RECONNECT_BASE_S
+                # Swap into the holder so Sender also uses the live client.
+                session["client"] = client
+                logger.info("Listener: MAX reconnected")
 
     def _stop_loop_thread(self) -> None:
         """Stop the dedicated event-loop thread.
