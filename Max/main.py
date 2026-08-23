@@ -836,6 +836,15 @@ class Max(BaseModule):
         )
         self.sender = self.Sender(list(self.credentials), user_id, self._session)
 
+        # The kernel wires ONLY the sender (crypto_layer.init_module);
+        # starting the receiver is the MODULE's job (VK-module precedent:
+        # Thread(target=listener.listen).start()). Without this thread the
+        # packet callback is never registered and nothing is ever received.
+        self._listener_thread = threading.Thread(
+            target=self.listener.listen, name="max-listener", daemon=True
+        )
+        self._listener_thread.start()
+
         # Task 7: watcher thread armed LAST — the shared stop_event is the
         # single shutdown signal (docs §3.4: the core sends DISCONNECT,
         # the module just quietly stops).
@@ -965,6 +974,9 @@ class Max(BaseModule):
         # thread via the task-4 primitive (stop + join + close).
         if sender is not None:
             sender.join_worker(timeout=_THREAD_JOIN_TIMEOUT_S)
+        listener_thread = getattr(self, "_listener_thread", None)
+        if listener_thread is not None and listener_thread.is_alive():
+            listener_thread.join(timeout=_THREAD_JOIN_TIMEOUT_S)
         if listener is not None:
             ingest_thread = listener._ingest_thread
             if ingest_thread is not None:

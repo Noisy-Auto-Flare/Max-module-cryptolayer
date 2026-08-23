@@ -9,6 +9,7 @@ import importlib
 import inspect
 import sys
 import threading
+import time
 
 import pytest
 
@@ -34,6 +35,8 @@ class FakeClient:
             else login_response
         )
         self.login_error = login_error
+        self.packet_callback = None
+        self._recv_task = None  # duck-typed by Listener._ws_dead
 
     async def connect(self):
         self.connect_calls += 1
@@ -46,6 +49,9 @@ class FakeClient:
         if self.login_error is not None:
             raise self.login_error
         return self.login_response
+
+    def set_packet_callback(self, function):  # contract §3: sync registration
+        self.packet_callback = function
 
 
 @pytest.fixture
@@ -192,6 +198,31 @@ class TestFailures:
         mod.create_session(lambda text: None)
         assert mod._session["my_id"] == 555
         mod.stop()
+
+    def test_create_session_auto_starts_listener_thread(self, make_module):
+        """REGRESSION (live ping-timeout bug): the kernel wires only the
+        sender, so create_session itself must start the listener thread —
+        which registers the packet callback on the client. Without the
+        auto-start nothing is ever received (sending still works, so the
+        failure mode is a one-way transport + kernel ping timeout)."""
+        mod, client = make_module()
+        # BaseModule.stop_event is CLASS-level and shared across instances:
+        # a previous test's stop() leaves it set, which would make the
+        # listener thread exit instantly. Reset for a clean slate.
+        mod.stop_event.clear()
+        mod.create_session(lambda text: None)
+        try:
+            # The listener thread is up...
+            assert mod._listener_thread.is_alive()
+            assert mod._listener_thread.name == "max-listener"
+            # ...and registration happened WITHOUT anyone calling listen().
+            deadline = time.monotonic() + 2.0
+            while client.packet_callback is None and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert client.packet_callback is not None
+        finally:
+            mod.stop()
+        assert not mod._listener_thread.is_alive()
 
     def test_no_thread_leak_after_failure(self, make_module):
         before = threading.active_count()
