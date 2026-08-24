@@ -54,6 +54,7 @@ import logging
 import queue
 import random
 import threading
+import time
 
 from base_module import BaseModule, Credential
 
@@ -68,6 +69,10 @@ _THREAD_JOIN_TIMEOUT_S = 5.0
 # Contract §6: disconnect is awaited through run_coroutine_threadsafe
 # with its OWN bounded timeout (plan task 7).
 _DISCONNECT_TIMEOUT_S = 10.0
+# Humanized read receipts (contract §15): an incoming message is marked
+# read roughly this many seconds after delivery — instant «read» would
+# look bot-like. Monkeypatchable in tests.
+_READ_RECEIPT_DELAY_S = 1.0
 
 _DEFAULT_MIN_PAUSE_S = 2.0
 _DEFAULT_MAX_PAUSE_S = 6.0
@@ -106,6 +111,36 @@ def _build_client(token: str, device_id: str):
     from vkmax.client import MaxClient  # lazy import on purpose
 
     return MaxClient()
+
+
+def _arm_online_presence(client):
+    """Patch the client's keepalive to report an ACTIVE web client.
+
+    Contract §14: vkmax's keepalive loop sends ``opcode 1 {"interactive":
+    False}`` every 30 s (client.py:176-184) — backgrounded-client
+    semantics, which is why the account shows «не в сети» to the peer.
+    Replacing the INSTANCE method keeps the library's 30 s timing and
+    task lifecycle but flips the flag to ``True`` («в сети») for as long
+    as the module runs; on terminal shutdown the loop dies with the
+    session and the account goes offline naturally. Timeout semantics
+    mirror the original (15 s, warning on timeout); other errors are
+    logged at debug — the Listener's own supervision handles reconnects.
+    """
+
+    async def _interactive_keepalive():
+        try:
+            async with asyncio.timeout(15):
+                await client.invoke_method(
+                    opcode=1, payload={"interactive": True}
+                )
+        except asyncio.TimeoutError:
+            logger.warning("MAX keepalive ping timed out")
+        except Exception as exc:  # noqa: BLE001 — shutdown races are legal
+            logger.debug(
+                "MAX keepalive skipped: %s: %s", type(exc).__name__, exc
+            )
+
+    client._send_keepalive_packet = _interactive_keepalive
 
 
 # --- Sender (task 6): pacing, error classification, bounded queue ---
@@ -542,10 +577,52 @@ class Max(BaseModule):
                     )
                     return
                 self._enqueue(str(text))
+                # Humanized read receipt (contract §15): mark the message
+                # read ~1 s after delivery so the peer sees «прочитано»
+                # the way a human web client would produce it.
+                self._schedule_read_mark(message["id"])
             except Exception:  # noqa: BLE001 — handler must never kill ws
                 logger.warning(
                     "Listener: packet handling failed", exc_info=True
                 )
+
+        def _schedule_read_mark(self, message_id):
+            """Fire one opcode-50 READ_MESSAGE ~_READ_RECEIPT_DELAY_S later.
+
+            Contract §15 (docs/opcodes.md v11): payload
+            ``{"type": "READ_MESSAGE", "chatId": …, "messageId": …,
+            "mark": <epoch ms>}``. Runs as a task on the session loop (we
+            are ON that loop inside _on_packet); failures are warnings —
+            a missed read mark must never affect message delivery.
+            """
+            session = self.session
+            client = session["client"]
+            chat_id = session["chat_id"]
+
+            async def _mark_read():
+                await asyncio.sleep(_READ_RECEIPT_DELAY_S)
+                try:
+                    await asyncio.wait_for(
+                        client.invoke_method(
+                            opcode=50,
+                            payload={
+                                "type": "READ_MESSAGE",
+                                "chatId": chat_id,
+                                "messageId": str(message_id),
+                                "mark": int(time.time() * 1000),
+                            },
+                        ),
+                        timeout=_SEND_TIMEOUT_S,
+                    )
+                except Exception as exc:  # noqa: BLE001 — best effort
+                    logger.warning(
+                        "Listener: read-mark failed for message %s (%s: %s)",
+                        message_id,
+                        type(exc).__name__,
+                        exc,
+                    )
+
+            asyncio.get_running_loop().create_task(_mark_read())
 
         def _enqueue(self, text: str):
             """Hand one filtered chunk to the ingest worker (non-blocking)."""
@@ -630,6 +707,7 @@ class Max(BaseModule):
             asyncio.run_coroutine_threadsafe(
                 _bring_up(), self.session["loop"]
             ).result(_RESULT_TIMEOUT_S + 1.0)
+            _arm_online_presence(client)
             self._register_on(client)
             return client
 
@@ -789,6 +867,9 @@ class Max(BaseModule):
                 client.login_by_token(token, device_id),
                 timeout=_LOGIN_TIMEOUT_S,
             )
+            # Contract §14: report «в сети» for as long as the module runs
+            # (the library's own keepalive would report False every 30 s).
+            _arm_online_presence(client)
             return client, response
 
         try:

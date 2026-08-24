@@ -311,3 +311,46 @@ vkmax @ git+https://github.com/nsdkinx/vkmax@c67a5097ac3e565dfb5d2448f9b17aff7f9
 | реконнект | собственный цикл адаптера: новый `MaxClient()` → `connect()` → `login_by_token`; hook `set_reconnect_callback` НЕ использовать (упрощение отладки) |
 | остановка | идемпотентная обёртка вокруг `await client.disconnect()` (см. §6) |
 | discovery чатов | `resp["payload"]["chats"]` из логина; резерв `resolve_channel_id` (op 48) — см. §10 |
+
+## 14. PRESENCE («в сети») — по docs/opcodes.md v11 репозитория
+
+- Opcode **1** с payload `{"interactive": bool}` — пакет присутствия/keepalive.
+- Сам vkmax шлёт его каждые 30 сек как `{"interactive": False}`
+  (`client.py:176-184`, цикл `client.py:190-198`) — семантика
+  «свёрнутый/фоновый веб-клиент», поэтому собеседник видит «не в сети»,
+  хотя соединение живо. (В hello/login payload стоит
+  `"interactive": True` — `client.py:290` — но уже через 30 сек
+  keepalive переключает статус на False.)
+- **Решение адаптера**: после каждого успешного логина (create_session и
+  реконнект) инстанс-метод `client._send_keepalive_packet` заменяется на
+  версию с `{"interactive": True}` — тайминг библиотеки (30 сек) и
+  жизненный цикл keepalive-таски сохраняются, меняется только флаг.
+  Таймаут 15 сек и warning при таймауте зеркалят оригинал; прочие
+  исключения — debug-лог (реконнектами ведает супервизор Listener'а).
+- При остановке модуля keepalive-таска гаснет вместе с сессией — аккаунт
+  уходит в «не в сети» естественно. Живая проверка флага — за владельцем.
+
+## 15. READ-КВИТАНЦИИ («прочитано») — по docs/opcodes.md v11 репозитория
+
+- Готовой функции в vkmax НЕТ (grep по пакету — 0). Сырой вызов:
+
+  ```python
+  await client.invoke_method(
+      opcode=50,
+      payload={
+          "type": "READ_MESSAGE",
+          "chatId": chat_id,
+          "messageId": str(message_id),   # из payload.message.id (op=128)
+          "mark": int(time.time() * 1000)  # epoch ms, как в примерах доки
+      },
+  )
+  ```
+
+- Пример доки: `{"type":"READ_MESSAGE","chatId":chatid,"messageId":"messageid","mark":175xxxxxxxxxx}`.
+  Тот же opcode 50 с `"type": "SET_AS_UNREAD"` делает чат непрочитанным —
+  НЕ используется адаптером.
+- **Семантика адаптера**: входящее сообщение помечается прочитанным через
+  `_READ_RECEIPT_DELAY_S` (по умолчанию 1.0 c — «человеческая» задержка)
+  после доставки в ingest-очередь; задача выполняется на цикле сессии,
+  любые ошибки — warning без влияния на доставку (best effort).
+- Живая проверка (галочка «прочитано» у собеседника) — за владельцем.

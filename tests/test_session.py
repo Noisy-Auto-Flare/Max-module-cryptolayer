@@ -5,6 +5,7 @@ methods returning canned data); the vkmax factory ``Max.main._build_client``
 is monkeypatched, so nothing here touches the real protocol.
 """
 
+import asyncio
 import importlib
 import inspect
 import sys
@@ -37,6 +38,7 @@ class FakeClient:
         self.login_error = login_error
         self.packet_callback = None
         self._recv_task = None  # duck-typed by Listener._ws_dead
+        self.invokes = []  # (opcode, payload) recorder for raw invokes
 
     async def connect(self):
         self.connect_calls += 1
@@ -52,6 +54,10 @@ class FakeClient:
 
     def set_packet_callback(self, function):  # contract §3: sync registration
         self.packet_callback = function
+
+    async def invoke_method(self, opcode=0, payload=None, retries=2):
+        self.invokes.append((opcode, payload))
+        return None
 
 
 @pytest.fixture
@@ -223,6 +229,25 @@ class TestFailures:
         finally:
             mod.stop()
         assert not mod._listener_thread.is_alive()
+
+    def test_online_presence_armed_after_login(self, make_module):
+        """Contract §14: after create_session the client's keepalive must
+        be patched to report {"interactive": True} («в сети»), instead of
+        the library default {"interactive": False} («не в сети»)."""
+        mod, client = make_module()
+        mod.stop_event.clear()
+        mod.create_session(lambda text: None)
+        try:
+            patched = getattr(client, "_send_keepalive_packet", None)
+            assert patched is not None
+            # The patch is an INSTANCE attribute shadowing the class method.
+            assert "MaxClient" not in repr(patched)
+            # Invoking it must fire opcode 1 with interactive=True.
+            asyncio.run(patched())
+            assert (1, {"interactive": True}) in client.invokes
+            assert (1, {"interactive": False}) not in client.invokes
+        finally:
+            mod.stop()
 
     def test_no_thread_leak_after_failure(self, make_module):
         before = threading.active_count()

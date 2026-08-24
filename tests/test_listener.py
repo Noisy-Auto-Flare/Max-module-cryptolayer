@@ -79,6 +79,7 @@ class FakeClient:
         self.callbacks = []
         self.connect_calls = 0
         self.login_calls = 0
+        self.invokes = []  # (opcode, payload) recorder for raw invokes
         # Pending future ⇒ connection healthy (mirrors _recv_task);
         # tests swap in a duck-typed DeadTask to simulate a drop.
         self._recv_task = None
@@ -86,6 +87,10 @@ class FakeClient:
     # contract §3: SYNC registration, async fn with two positional args
     def set_packet_callback(self, function):
         self.callbacks.append(function)
+
+    async def invoke_method(self, opcode=0, payload=None, retries=2):
+        self.invokes.append((opcode, payload))
+        return None
 
     async def connect(self):
         if self.fail_connect is not None:
@@ -246,6 +251,46 @@ class TestHappyPath:
         handle.event.set()
         handle.listener.listen()  # blocking call returns right away
         assert len(handle.session["client"].callbacks) == 1
+
+    def test_read_receipt_fired_after_humanized_delay(self, monkeypatch):
+        """Contract §15: a delivered message is marked read (opcode 50,
+        READ_MESSAGE) ~1 s later against session['client']."""
+        monkeypatch.setattr(MaxMain, "_READ_RECEIPT_DELAY_S", 0.01)
+        handle = make_listener(monkeypatch)
+        client = handle.session["client"]
+        handle.listener._register_on(client)
+        try:
+            dispatch_sync(handle, client, msg_packet())  # id="m1"
+            wait_until(
+                lambda: client.invokes,
+                message="read receipt was never invoked",
+            )
+            assert client.invokes[0][0] == 50
+            payload = client.invokes[0][1]
+            assert payload["type"] == "READ_MESSAGE"
+            assert payload["chatId"] == CHAT_ID
+            assert payload["messageId"] == "m1"
+            assert isinstance(payload["mark"], int)
+        finally:
+            handle.loop_box.stop()
+
+    def test_read_receipt_not_fired_for_filtered_packets(self, monkeypatch):
+        """Own echo / foreign chat must NOT produce read marks."""
+        monkeypatch.setattr(MaxMain, "_READ_RECEIPT_DELAY_S", 0.01)
+        handle = make_listener(monkeypatch)
+        client = handle.session["client"]
+        handle.listener._register_on(client)
+        try:
+            dispatch_sync(
+                handle, client, msg_packet(sender=MY_ID)
+            )  # own echo
+            dispatch_sync(
+                handle, client, msg_packet(chat_id=CHAT_ID + 1)
+            )  # foreign chat
+            time.sleep(0.15)  # generous window for any wrongful invoke
+            assert client.invokes == []
+        finally:
+            handle.loop_box.stop()
 
 
 class TestFiltering:
