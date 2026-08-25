@@ -71,9 +71,11 @@ pip install -r Max/requirements.txt
 
 1. Откройте [web.max.ru](https://web.max.ru) и войдите в аккаунт.
 2. **F12** (DevTools) → вкладка **Application** → **Local Storage** → `https://web.max.ru`.
-3. Скопируйте целиком два значения:
-   - **`__oneme_auth`** — это ваш **Token**;
-   - **`__oneme_device_id`** — это ваш **Device ID**.
+3. Найдите ключи:
+   - **`__oneme_auth`** — внутри хранится JSON вида `{"token":"...","...":...}`.
+     **Скопируйте именно значение поля `token`** (строку без кавычек и без фигурных скобок).
+     `discover_chats.py` примет и весь JSON целиком, но в CryptoLayer CLI нужно вставлять **только токен**.
+   - **`__oneme_device_id`** — значение этого ключа и есть ваш **Device ID** (копируйте целиком).
 
 Это доступ к учётной записи — не публикуйте и не передавайте. Токен ротируется при каждом перелогине — скопировали, сразу используйте.
 
@@ -96,9 +98,9 @@ chat_id                название/тип                             по�
 ...
 ```
 
-Возьмите **chat_id** диалога с собеседником. **Важно:** числа у вас и у собеседника будут РАЗНЫЕ — каждому нужен id из своего списка!
+Возьмите **chat_id** диалога с собеседником. На практике у обоих собеседников этот ID **скорее всего одинаковый** (один диалог — один ID), но проверьте на каждой стороне своим `discover_chats.py`.
 
-**Шаблон:** `python scripts/discover_chats.py --token "ваш_токен_целиком" --device-id "ваш_device_id_целиком"`
+**Шаблон:** `python scripts/discover_chats.py --token "только_значение_token" --device-id "ваш_device_id_целиком"`
 
 ### Шаг 4. Поставьте CryptoLayer CLI
 
@@ -109,12 +111,14 @@ cd cryptolayer-cli
 # после проверки, что CLI стартует — выйдите из него
 ```
 
-На Windows без Git Bash — вручную:
+На Windows без Git Bash — вручную (PowerShell — `&&` не работает, выполняйте по строкам):
 
 ```bash
 git submodule update --init --recursive
-python -m venv venv && venv\Scripts\activate
+python -m venv venv
+venv\Scripts\activate
 python src/modules/generate_reqs.py
+python src/modules/generate_hidden_imports.py
 pip install -r requirements.txt
 ```
 
@@ -133,8 +137,9 @@ cp -r Max/  <путь-к-cryptolayer-cli>/src/modules/Max
 
 ```bash
 cd <путь-к-cryptolayer-cli>
-# тем же python, которым будете запускать CLI:
+# тем же python, которым будете запускать CLI (venv активирован):
 python src/modules/generate_reqs.py
+python src/modules/generate_hidden_imports.py
 pip install -r src/modules/common_requirements.txt
 # проверка:
 pip show vkmax

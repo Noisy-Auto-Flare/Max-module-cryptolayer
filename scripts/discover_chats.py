@@ -78,7 +78,24 @@ async def safe_disconnect(client) -> None:
 # --- main flow --------------------------------------------------------------
 
 
+def _extract_token(raw: str) -> str:
+    """Allow pasting the whole __oneme_auth JSON: extract .token if present."""
+    text = raw.strip()
+    if text.startswith("{"):
+        try:
+            data = json.loads(text)
+            if isinstance(data, dict) and "token" in data:
+                return str(data["token"])
+        except Exception:
+            pass
+    # strip surrounding quotes if user copied JSON string value with quotes
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in ('"', "'"):
+        text = text[1:-1]
+    return text
+
+
 async def run(token: str, device_id: str, raw: bool) -> int:
+    token = _extract_token(token)
     from vkmax.client import MaxClient  # lazy import; offline --help must work
 
     client = MaxClient()
@@ -108,10 +125,13 @@ async def run(token: str, device_id: str, raw: bool) -> int:
 
     my_id = "?"
     try:
-        my_id = resp["payload"]["profile"]["id"]
+        my_id = resp["payload"]["profile"]["contact"]["id"]
     except (KeyError, TypeError):
-        print("[warn] profile.id not found in login response "
-              "(live-checkpoint observation)", file=sys.stderr)
+        try:
+            my_id = resp["payload"]["profile"]["id"]
+        except (KeyError, TypeError):
+            print("[warn] profile.id not found in login response "
+                  "(live-checkpoint observation)", file=sys.stderr)
 
     chats = extract_chats(resp)
     if raw:
