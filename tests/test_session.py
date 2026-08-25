@@ -70,7 +70,7 @@ def make_module(monkeypatch):
         monkeypatch.setattr(MaxMain, "_build_client", lambda t, d: client)
         mod = MaxMain.Max()
         mod.init(
-            ["tok", "dev", "123", "", ""] if creds is None else creds,
+            ["tok", "dev", "", ""] if creds is None else creds,
             user_id,
         )
         created.append(mod)
@@ -150,7 +150,7 @@ class TestHappyPath:
         self, make_module, raw_min, raw_max, exp_min, exp_max
     ):
         mod, _client = make_module(
-            creds=["t", "d", "555", raw_min, raw_max]
+            creds=["t", "d", raw_min, raw_max], user_id="555"
         )
         mod.create_session(lambda text: None)
 
@@ -270,7 +270,7 @@ class TestFailures:
         assert getattr(mod, "_loop_thread", None) is None
 
     def test_non_integer_chat_id_rejected(self, make_module):
-        mod, _client = make_module(creds=["t", "d", "not-a-number", "", ""])
+        mod, _client = make_module(creds=["t", "d", "", ""], user_id="not-a-number")
 
         with pytest.raises(ValueError, match="Chat ID"):
             mod.create_session(lambda text: None)

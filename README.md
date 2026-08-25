@@ -50,15 +50,15 @@ web.max.ru) через библиотеку [vkmax](https://github.com/nsdkinx/v
    и прямое использование:
 
    ```python
-   from Max.main import Max
+    from Max.main import Max
 
-   module = Max()
-   module.init(["<Token>", "<Device ID>", "<Chat ID>", "", ""], user_id="<Chat ID>")
-   # CryptoLayer(ui_provider, data_dir, module_class=module, password, wordcoder_dict)
-   ```
+    module = Max()
+    module.init(["<Token>", "<Device ID>", "", ""], user_id="<Chat ID>")
+    # CryptoLayer(ui_provider, data_dir, module_class=module, password, wordcoder_dict)
+    ```
 
-Значения credentials (Token = `__oneme_auth`, Device ID = `__oneme_device_id`
-из LocalStorage web.max.ru, Chat ID через `scripts/discover_chats.py`) —
+Значения credentials (Token/ Device ID из LocalStorage web.max.ru, Chat ID
+через `scripts/discover_chats.py` как Peer ID) —
 пошаговая инструкция в [Max/README.md](Max/README.md).
 
 ## Почему vkmax

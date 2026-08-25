@@ -6,11 +6,11 @@ messages through a personal MAX account via the unofficial user-API
 library ``vkmax`` (see ``docs/vkmax-contract.md`` — source of truth for
 all vkmax adapter names, pinned in task 2).
 
-ADDRESSING RULE (fixed since task 3):
-    The dialog address is SOLELY the credential «Chat ID» — MAX dialogs
-    are addressed by chat_id. The constructor argument ``user_id`` is
-    validated non-empty; if it differs from Chat ID, a warning is logged
-    and **Chat ID wins** as the single authoritative address.
+ADDRESSING RULE (refactored: Chat ID is Peer ID):
+    The dialog address is SOLELY the ``user_id``/Peer ID passed to
+    ``init(creds, user_id)`` — the ``Chat ID`` credential no longer exists.
+    Credentials hold only auth (Token, Device ID) and pacing; the peer
+    field is the single source of truth for the dialog address.
 
 Session adapter (task 4): ``create_session(ingester)`` runs a dedicated
 daemon thread hosting an asyncio event loop (ProactorEventLoop on Windows
@@ -264,11 +264,6 @@ class Max(BaseModule):
     expected_credentials = [
         Credential("Token", "…__oneme_auth из LocalStorage web.max.ru"),
         Credential("Device ID", "…__oneme_device_id"),
-        Credential(
-            "Chat ID",
-            "числовой id диалога с собеседником (узнаётся через "
-            "discover_chats.py — скрипт поставляется с модулем)",
-        ),
         Credential("Мин. пауза, сек", "пауза между отправками; пусто = 2"),
         Credential("Макс. пауза, сек", "пусто = 6"),
     ]
@@ -290,20 +285,9 @@ class Max(BaseModule):
         _QUEUE_MAXSIZE = 1000
 
         def __init__(self, credentials, user_id, session):
-            # ADDRESSING RULE: validate user_id non-empty; Chat ID credential
-            # is the sole dialog address and always wins over user_id
-            # (warning logged on mismatch).
             if not user_id:
-                raise ValueError("user_id must be non-empty")
+                raise ValueError("user_id must be non-empty (Peer ID = Chat ID)")
             super().__init__(credentials, user_id)
-            chat_id_cred = credentials[2] if len(credentials) > 2 else ""
-            if chat_id_cred and str(chat_id_cred).strip() != str(user_id).strip():
-                logger.warning(
-                    "user_id (%r) differs from Chat ID credential (%r); "
-                    "Chat ID wins as the sole dialog address",
-                    user_id,
-                    chat_id_cred,
-                )
             self.session = session
             self._queue = queue.Queue(maxsize=self._QUEUE_MAXSIZE)
             self._worker_stop = threading.Event()
@@ -496,21 +480,11 @@ class Max(BaseModule):
         """
 
         def __init__(self, credentials, ingester, user_id, session):
-            # Same addressing rule as Sender: user_id validated non-empty,
-            # Chat ID credential is authoritative on mismatch.
             if not user_id:
-                raise ValueError("user_id must be non-empty")
+                raise ValueError("user_id must be non-empty (Peer ID = Chat ID)")
             super().__init__(
                 credentials, ingester, user_id, session["stop_event"]
             )
-            chat_id_cred = credentials[2] if len(credentials) > 2 else ""
-            if chat_id_cred and str(chat_id_cred).strip() != str(user_id).strip():
-                logger.warning(
-                    "user_id (%r) differs from Chat ID credential (%r); "
-                    "Chat ID wins as the sole dialog address",
-                    user_id,
-                    chat_id_cred,
-                )
             self.session = session
             # Base Listener.__init__ does NOT keep credentials; reconnect
             # needs Token/Device ID, so keep our own normalized copy.
@@ -813,33 +787,33 @@ class Max(BaseModule):
         degraded mode.
         """
         credentials = list(getattr(self, "credentials", None) or [])
-        if len(credentials) < 3:
+        if len(credentials) < 2:
             raise ValueError(
                 "module has no credentials: call init(creds, user_id) first"
             )
         token = str(credentials[0]).strip()
         device_id = str(credentials[1]).strip()
 
-        raw_chat_id = str(credentials[2]).strip()
+        user_id = getattr(self, "user_id", "")
+        if not user_id:
+            # Fail BEFORE spawning any thread — no resources to leak.
+            raise ValueError("user_id must be non-empty (Peer ID = Chat ID)")
+
+        raw_chat_id = str(user_id).strip()
         try:
             chat_id = int(raw_chat_id)
         except ValueError as exc:
             raise ValueError(
-                f"Chat ID must be an integer, got {raw_chat_id!r}"
+                f"Chat ID (Peer ID) must be an integer, got {raw_chat_id!r}"
             ) from exc
 
-        user_id = getattr(self, "user_id", "")
-        if not user_id:
-            # Fail BEFORE spawning any thread — no resources to leak.
-            raise ValueError("user_id must be non-empty")
-
         min_pause = _parse_pause(
-            credentials[3] if len(credentials) > 3 else "",
+            credentials[2] if len(credentials) > 2 else "",
             _DEFAULT_MIN_PAUSE_S,
             "Мин. пауза, сек",
         )
         max_pause = _parse_pause(
-            credentials[4] if len(credentials) > 4 else "",
+            credentials[3] if len(credentials) > 3 else "",
             _DEFAULT_MAX_PAUSE_S,
             "Макс. пауза, сек",
         )

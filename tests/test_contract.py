@@ -36,14 +36,13 @@ class TestRequiredAttributes:
         assert names == [
             "Token",
             "Device ID",
-            "Chat ID",
             "Мин. пауза, сек",
             "Макс. пауза, сек",
         ]
 
     def test_get_creds_returns_five_pairs(self):
         pairs = MaxMain.Max().get_creds()
-        assert len(pairs) == 5
+        assert len(pairs) == 4
         for pair in pairs:
             assert isinstance(pair, dict) and len(pair) == 1
 
@@ -54,7 +53,7 @@ class TestRequiredAttributes:
     def test_stub_bodies_raise_not_implemented(self):
         # Task 4 wired construction (create_session + instantiable nested
         # classes with a session holder).
-        creds = ["tok", "dev", "123", "", ""]
+        creds = ["tok", "dev", "", ""]
         client = _CallbackClient()
         session = {
             "client": client,
