@@ -125,6 +125,9 @@ def _arm_online_presence(client):
     session and the account goes offline naturally. Timeout semantics
     mirror the original (15 s, warning on timeout); other errors are
     logged at debug — the Listener's own supervision handles reconnects.
+
+    An immediate presence packet is also sent so the peer sees «в сети»
+    without waiting up to 30 s for the next keepalive tick.
     """
 
     async def _interactive_keepalive():
@@ -141,6 +144,14 @@ def _arm_online_presence(client):
             )
 
     client._send_keepalive_packet = _interactive_keepalive
+    # Fire-and-forget immediate presence so «в сети» appears at once.
+    try:
+        loop = asyncio.get_running_loop()
+        loop.create_task(_interactive_keepalive())
+    except RuntimeError:
+        # No running loop (e.g. during tests with FakeClient) — keepalive
+        # loop will still send the first tick within 30 s.
+        pass
 
 
 # --- Sender (task 6): pacing, error classification, bounded queue ---
