@@ -266,7 +266,8 @@ class Max(BaseModule):
         Credential("Device ID", "…__oneme_device_id"),
         Credential(
             "Chat ID",
-            "числовой id диалога с собеседником (см. scripts/discover_chats.py)",
+            "числовой id диалога с собеседником (узнаётся через "
+            "discover_chats.py — скрипт поставляется с модулем)",
         ),
         Credential("Мин. пауза, сек", "пауза между отправками; пусто = 2"),
         Credential("Макс. пауза, сек", "пусто = 6"),
