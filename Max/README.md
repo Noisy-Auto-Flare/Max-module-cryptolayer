@@ -145,6 +145,18 @@ pip install -r src/modules/common_requirements.txt
 pip show vkmax
 ```
 
+> **Если `generate_hidden_imports.py` упал с `SyntaxError: invalid syntax` на строке `import vkmax @ git+...`** — это известный баг официального сборника: генератор не понимает зависимости вида `pkg @ git+https://...` (PEP 508). Почините его один раз:
+> ```powershell
+> notepad src\modules\generate_hidden_imports.py
+> # найдите: pkg = mod.strip().split('==')[0].split('>=')[0]
+> # замените на:
+> # pkg = mod.split('@')[0].split('==')[0].split('>=')[0].split('<=')[0].split('<')[0].split('>')[0].strip()
+> # и добавьте проверку: if pkg: hidden_imports.add(pkg)
+> # сохраните, затем снова:
+> python src/modules/generate_hidden_imports.py
+> ```
+> Фикс войдёт в PR сборника позже; пока — этот патч центрально документирован здесь.
+
 ### Шаг 7. Запустите чат (на ОБОИХ компьютерах)
 
 ```bash
@@ -168,10 +180,10 @@ CLI спросит по очереди:
 
 5. **Peer ID (in module)** — тот же Chat ID, что в п.3 (поле не может быть пустым; приоритет у Chat ID).
 
-**Шаблон заполнения:**
+**Шаблон заполнения (Token — только значение поля `token` из JSON `__oneme_auth`):**
 
 ```
-Token: <вставьте __oneme_auth целиком>
+Token: <только token, без кавычек и скобок>
 Device ID: <вставьте __oneme_device_id целиком>
 Chat ID: 22508851
 Мин. пауза, сек: [Enter]
